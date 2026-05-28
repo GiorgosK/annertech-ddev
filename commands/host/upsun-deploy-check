@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+## Description: Check latest Upsun deploy/push activity log for issues
+## Usage: upsun-deploy-check [-e ENV] [-l LIMIT] [--show-activity-list]
+
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ddev upsun-deploy-check [-e ENV] [-l LIMIT] [--show-activity-list]
+
+Description:
+  Finds the latest deploy/push-related Upsun activity, fetches its log,
+  and scans for potential problems.
+
+Options:
+  -e, --env ENV            Environment name (default: current git branch)
+  -l, --limit N            Number of activities to inspect (default: 30)
+      --show-activity-list Print full activity list before analysis
+  -h, --help               Show this help
+USAGE
+}
+
+ENV_NAME=""
+LIMIT=30
+SHOW_LIST=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -e|--env)
+      ENV_NAME="${2:-}"
+      shift 2
+      ;;
+    -l|--limit)
+      LIMIT="${2:-}"
+      shift 2
+      ;;
+    --show-activity-list)
+      SHOW_LIST=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: --limit must be a positive integer" >&2
+  exit 2
+fi
+
+if ! command -v ddev >/dev/null 2>&1; then
+  echo "ERROR: 'ddev' command was not found in PATH." >&2
+  exit 127
+fi
+
+ENV_FROM_GIT=0
+if [[ -z "$ENV_NAME" ]]; then
+  if command -v git >/dev/null 2>&1; then
+    ENV_NAME="$(git branch --show-current 2>/dev/null || true)"
+    [[ -n "$ENV_NAME" ]] && ENV_FROM_GIT=1
+  fi
+fi
+if [[ -z "$ENV_NAME" ]]; then
+  ENV_NAME="dev"
+fi
+
+echo "Using ddev command: upsun"
+echo "Target environment: $ENV_NAME"
+
+tmp_activities="$(mktemp)"
+tmp_log="$(mktemp)"
+cleanup() {
+  rm -f "$tmp_activities" "$tmp_log"
+}
+trap cleanup EXIT
+
+run_activities() {
+  local env="$1"
+  set +e
+  ddev upsun activities --exclude-type '*.cron,*.backup*' -e "$env" --limit "$LIMIT" >"$tmp_activities" 2>&1
+  local status=$?
+  set -e
+  return $status
+}
+
+if ! run_activities "$ENV_NAME"; then
+  activities_status=$?
+  if [[ $ENV_FROM_GIT -eq 1 ]]; then
+    for fallback_env in dev main master; do
+      [[ "$fallback_env" == "$ENV_NAME" ]] && continue
+      if run_activities "$fallback_env"; then
+        echo "Falling back to environment: $fallback_env"
+        ENV_NAME="$fallback_env"
+        activities_status=0
+        break
+      fi
+    done
+  fi
+else
+  activities_status=0
+fi
+
+if [[ $activities_status -ne 0 ]]; then
+  echo "ERROR: Failed to fetch activities for env '$ENV_NAME'." >&2
+  cat "$tmp_activities" >&2
+  exit $activities_status
+fi
+
+if [[ $SHOW_LIST -eq 1 ]]; then
+  echo ""
+  echo "=== Activity list ==="
+  cat "$tmp_activities"
+  echo "=== End activity list ==="
+  echo ""
+fi
+
+activity_row="$(awk -F'|' '
+  /^\|/ {
+    id=$2; desc=$4; state=$6; result=$7;
+    gsub(/^[ \t]+|[ \t]+$/, "", id);
+    gsub(/^[ \t]+|[ \t]+$/, "", desc);
+    gsub(/^[ \t]+|[ \t]+$/, "", state);
+    gsub(/^[ \t]+|[ \t]+$/, "", result);
+
+    if (id=="ID" || id=="" || desc=="Description") next;
+    low=tolower(desc);
+
+    if (low ~ /(push|deploy|redeploy|activate)/) {
+      print id "\t" desc "\t" state "\t" result;
+      exit;
+    }
+  }
+' "$tmp_activities")"
+
+if [[ -z "$activity_row" ]]; then
+  echo "No deploy/push-like activity found in the latest $LIMIT activities for '$ENV_NAME'."
+  exit 3
+fi
+
+ACT_ID="${activity_row%%$'\t'*}"
+REST="${activity_row#*$'\t'}"
+ACT_DESC="${REST%%$'\t'*}"
+REST2="${REST#*$'\t'}"
+ACT_STATE="${REST2%%$'\t'*}"
+ACT_RESULT="${REST2#*$'\t'}"
+
+echo "Latest deploy-like activity:"
+echo "  ID:          $ACT_ID"
+echo "  Description: $ACT_DESC"
+echo "  State:       $ACT_STATE"
+echo "  Result:      $ACT_RESULT"
+echo ""
+
+set +e
+ddev upsun activity:log "$ACT_ID" >"$tmp_log" 2>&1
+log_status=$?
+set -e
+
+if [[ $log_status -ne 0 ]]; then
+  echo "ERROR: Failed to fetch log for activity '$ACT_ID'." >&2
+  cat "$tmp_log" >&2
+  exit $log_status
+fi
+
+critical_re='(fatal|\berror\b|exception|panic|segfault|out of memory|oom|build failed|deploy(ment)? failed|rollback|permission denied|cannot\s+allocate|failed\s+with\s+exit\s+code|non-zero exit|traceback)'
+warning_re='(\bwarn(ing)?\b|deprecated|deprecation|retrying|timed out|timeout|slow|resource limit|disk (full|quota)|memory limit|unreachable)'
+notice_re='(\bnotice\b|\bhint\b|\binfo\b)'
+
+critical_hits="$(grep -Ein "$critical_re" "$tmp_log" || true)"
+warning_hits="$(grep -Ein "$warning_re" "$tmp_log" || true)"
+notice_hits="$(grep -Ein "$notice_re" "$tmp_log" || true)"
+
+echo "=== Analysis ==="
+crit_count=$(printf "%s\n" "$critical_hits" | sed '/^$/d' | wc -l | tr -d ' ')
+warn_count=$(printf "%s\n" "$warning_hits" | sed '/^$/d' | wc -l | tr -d ' ')
+notice_count=$(printf "%s\n" "$notice_hits" | sed '/^$/d' | wc -l | tr -d ' ')
+
+echo "Critical matches: $crit_count"
+echo "Warning matches:  $warn_count"
+echo "Notice matches:   $notice_count"
+echo ""
+
+print_matches() {
+  local label="$1"
+  local content="$2"
+  local max_lines=25
+  if [[ -n "$(printf "%s" "$content" | tr -d '\n\r\t ')" ]]; then
+    echo "$label (showing up to $max_lines lines):"
+    printf "%s\n" "$content" | head -n "$max_lines"
+    echo ""
+  fi
+}
+
+print_matches "Critical" "$critical_hits"
+print_matches "Warning" "$warning_hits"
+print_matches "Notice" "$notice_hits"
+
+if [[ "$ACT_STATE" != "complete" || "$ACT_RESULT" != "success" ]]; then
+  echo "Deployment status is not clean (state/result)."
+  exit 4
+fi
+
+if [[ "$crit_count" -gt 0 ]]; then
+  echo "Potential critical issues detected in deployment log."
+  exit 5
+fi
+
+if [[ "$warn_count" -gt 0 ]]; then
+  echo "Deployment completed, but warning-like patterns were detected."
+  exit 0
+fi
+
+echo "No obvious critical issues found in latest deploy activity log."
